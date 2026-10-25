@@ -1,0 +1,3 @@
+[workspace]
+version = "3.0"
+members = ["backend", "indexer", "mpc", "store"]

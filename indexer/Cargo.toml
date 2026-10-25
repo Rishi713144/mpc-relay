@@ -1,0 +1,11 @@
+[package]
+name = "indexer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tonic = "0.14.2"
+bytes = "1.10.1"
+futures = "0.3.31"
+yellowstone-grpc-proto = "9.0.0"
