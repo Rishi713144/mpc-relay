@@ -1,7 +1,8 @@
+use crate::middleware::jwt_secret;
 use actix_web::{HttpResponse, Result};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use chrono::{Duration, Utc};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
-use chrono::{Utc, Duration};
 
 #[derive(Deserialize)]
 pub struct SignUpRequest {
@@ -48,14 +49,23 @@ pub async fn sign_up(req: actix_web::web::Json<SignUpRequest>) -> Result<HttpRes
 #[actix_web::post("/signin")]
 pub async fn sign_in(req: actix_web::web::Json<SignInRequest>) -> Result<HttpResponse> {
     let _ = req;
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".to_string());
+    let Some(secret) = jwt_secret() else {
+        return Ok(HttpResponse::InternalServerError().body("JWT_SECRET is not configured"));
+    };
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
         .timestamp() as usize;
-    let claims = Claims { sub: "user".to_string(), exp: expiration };
-    let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))
-        .unwrap_or_else(|_| "jwt_token".to_string());
+    let claims = Claims {
+        sub: "user".to_string(),
+        exp: expiration,
+    };
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|error| actix_web::error::ErrorInternalServerError(error.to_string()))?;
     let response = SigninResponse { token };
     Ok(HttpResponse::Ok().json(response))
 }

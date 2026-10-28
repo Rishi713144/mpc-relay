@@ -13,7 +13,6 @@
 .DS_Store
 Thumbs.db
 
-assignment.txt
-
 # Assignment files (local only)
+assignment.txt
 assignment/
