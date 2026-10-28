@@ -1,15 +1,37 @@
+#![allow(deprecated)]
 #![allow(non_snake_case)]
 
 use curv::elliptic::curves::{Ed25519, Point, Scalar};
-use multi_party_eddsa::protocols::musig2::{self, PrivatePartialNonces, PublicPartialNonces};
 use multi_party_eddsa::protocols::ExpandedKeyPair;
-use solana_sdk::signature::{Keypair, Signature, Signer, SignerError};
-use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction};
+use multi_party_eddsa::protocols::musig2::{self, PrivatePartialNonces, PublicPartialNonces};
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_message::Message;
+use solana_native_token as native_token;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_signer::{Signer, SignerError};
+use solana_system_interface::instruction as system_instruction;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::Transaction;
 
-use crate::serialization::{AggMessage1, Error as DeserializationError, PartialSignature, SecretAggStepOne};
-use crate::{create_unsigned_transaction, Error};
+use crate::error::Error;
+use crate::serialization::{
+    AggMessage1, Error as DeserializationError, PartialSignature, SecretAggStepOne,
+};
 
-/// Create the aggregate public key, pass key=None if you don't care about the coefficient
+/// Build the SOL transfer transaction that all MPC nodes partial-sign.
+pub fn create_unsigned_transaction(
+    amount_lamports: u64,
+    to: &Pubkey,
+    payer: &Pubkey,
+) -> Transaction {
+    let transfer_ix = system_instruction::transfer(payer, to, amount_lamports);
+    let message = Message::new(&[transfer_ix], Some(payer));
+    Transaction::new_unsigned(message)
+}
+
+/// Build the aggregate public key. Pass `key=None` to get the plain aggregate.
 pub fn key_agg(keys: Vec<Pubkey>, key: Option<Pubkey>) -> Result<musig2::PublicKeyAgg, Error> {
     let convert_keys = |k: Pubkey| {
         Point::from_bytes(&k.to_bytes()).map_err(|e| Error::DeserializationFailed {
@@ -22,67 +44,139 @@ pub fn key_agg(keys: Vec<Pubkey>, key: Option<Pubkey>) -> Result<musig2::PublicK
     musig2::PublicKeyAgg::key_aggregation_n(keys, &key).ok_or(Error::KeyPairIsNotInKeys)
 }
 
-/// Generate Message1 which contains nonce, public nonce, and commitment to nonces
-pub fn step_one(keypair: Keypair) -> (AggMessage1, SecretAggStepOne) {
-    let extended_kepair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
-    // we don't really need to pass a message here.
-    let (private_nonces, public_nonces) = musig2::generate_partial_nonces(&extended_kepair, None);
+pub fn aggregate_public_key(keys: Vec<Pubkey>) -> Result<Pubkey, Error> {
+    let agg = key_agg(keys, None)?;
+    Pubkey::try_from(&*agg.agg_public_key.to_bytes(true))
+        .map_err(|_| Error::InvalidSignature)
+}
+
+/// Round 1: commit to nonces.
+pub fn step_one(keypair: &Keypair) -> (AggMessage1, SecretAggStepOne) {
+    let extended_keypair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
+    let (private_nonces, public_nonces) = musig2::generate_partial_nonces(&extended_keypair, None);
 
     (
-        AggMessage1 { sender: keypair.pubkey(), public_nonces: public_nonces.clone() },
-        SecretAggStepOne { private_nonces, public_nonces },
+        AggMessage1 {
+            sender: keypair.pubkey(),
+            public_nonces: public_nonces.clone(),
+        },
+        SecretAggStepOne {
+            private_nonces,
+            public_nonces,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn step_two(
-    keypair: Keypair,
-    amount: f64,
-    to: Pubkey,
-    memo: Option<String>,
-    recent_block_hash: Hash,
+/// Round 2: partial-sign arbitrary message bytes (works for SOL, SPL and Jupiter
+/// transactions because the backend passes the serialized message it built).
+pub fn step_two_raw(
+    keypair: &Keypair,
+    message: &[u8],
     keys: Vec<Pubkey>,
     first_messages: Vec<AggMessage1>,
     secret_state: SecretAggStepOne,
 ) -> Result<PartialSignature, Error> {
-    let other_nonces: Vec<_> = first_messages.into_iter().map(|msg1| msg1.public_nonces.R).collect();
+    let other_nonces: Vec<_> = first_messages
+        .into_iter()
+        .map(|msg1| msg1.public_nonces.R)
+        .collect();
 
-    // Generate the aggregate key together with the coefficient of the current keypair
     let aggkey = key_agg(keys, Some(keypair.pubkey()))?;
-    let aggpubkey = Pubkey::new(&*aggkey.agg_public_key.to_bytes(true));
-    let extended_kepair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
-
-    // Create the unsigned transaction
-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
+    let extended_keypair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
 
     let signer = PartialSigner {
         signer_private_nonce: secret_state.private_nonces,
         signer_public_nonce: secret_state.public_nonces,
         other_nonces,
-        extended_kepair,
+        extended_kepair: extended_keypair,
         aggregated_pubkey: aggkey,
     };
-    // Sign the transaction using a custom `PartialSigner`, this is required to comply with Solana's API.
-    tx.sign(&[&signer], recent_block_hash);
-    let sig = tx.signatures[0];
-    Ok(PartialSignature(sig))
+
+    let signature = signer
+        .try_sign_message(message)
+        .map_err(|error| Error::SigningFailed(error.to_string()))?;
+    Ok(PartialSignature(signature))
 }
 
-pub fn sign_and_broadcast(
-    amount: f64,
+/// Round 2 for a legacy SOL transfer.
+#[allow(clippy::too_many_arguments)]
+pub fn step_two(
+    keypair: &Keypair,
+    amount_lamports: u64,
     to: Pubkey,
-    memo: Option<String>,
     recent_block_hash: Hash,
     keys: Vec<Pubkey>,
-    signatures: Vec<PartialSignature>,
-) -> Result<Transaction, Error> {
-    let aggkey = key_agg(keys, None)?;
-    let aggpubkey = Pubkey::new(&*aggkey.agg_public_key.to_bytes(true));
+    first_messages: Vec<AggMessage1>,
+    secret_state: SecretAggStepOne,
+) -> Result<PartialSignature, Error> {
+    let aggkey = key_agg(keys.clone(), Some(keypair.pubkey()))?;
+    let aggpubkey = Pubkey::try_from(&*aggkey.agg_public_key.to_bytes(true))
+        .map_err(|_| Error::InvalidSignature)?;
 
-    // Make sure all the `R`s are the same
-    if !signatures[1..].iter().map(|s| &s.0.as_ref()[..32]).all(|s| s == &signatures[0].0.as_ref()[..32]) {
+    let mut tx = create_unsigned_transaction(amount_lamports, &to, &aggpubkey);
+    tx.message.recent_blockhash = recent_block_hash;
+
+    step_two_raw(
+        keypair,
+        &tx.message.serialize(),
+        keys,
+        first_messages,
+        secret_state,
+    )
+}
+
+/// Round 2 for a Jupiter `VersionedTransaction` (base64 from the swap API).
+pub fn step_two_swap(
+    keypair: &Keypair,
+    jupiter_swap_tx_base64: &str,
+    keys: Vec<Pubkey>,
+    first_messages: Vec<AggMessage1>,
+    secret_state: SecretAggStepOne,
+) -> Result<PartialSignature, Error> {
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        jupiter_swap_tx_base64,
+    )
+    .map_err(|_| Error::DeserializationFailed {
+        error: DeserializationError::BadBase64("invalid base64 transaction".to_string()),
+        field_name: "swap_transaction",
+    })?;
+
+    let tx: VersionedTransaction =
+        bincode::deserialize(&bytes).map_err(|_| Error::DeserializationFailed {
+            error: DeserializationError::FailedDeserialization(
+                "invalid versioned transaction".to_string(),
+            ),
+            field_name: "swap_transaction",
+        })?;
+
+    step_two_raw(
+        keypair,
+        &tx.message.serialize(),
+        keys,
+        first_messages,
+        secret_state,
+    )
+}
+
+/// Combine all partial signatures into one Ed25519 signature.
+pub fn aggregate_signature(
+    keys: Vec<Pubkey>,
+    signatures: Vec<PartialSignature>,
+) -> Result<Signature, Error> {
+    if signatures.is_empty() {
+        return Err(Error::BadRequest("no partial signatures provided".into()));
+    }
+    let _ = key_agg(keys, None)?;
+
+    if !signatures[1..]
+        .iter()
+        .map(|s| &s.0.as_ref()[..32])
+        .all(|s| s == &signatures[0].0.as_ref()[..32])
+    {
         return Err(Error::MismatchMessages);
     }
+
     let deserialize_R = |s| {
         Point::from_bytes(s).map_err(|e| Error::DeserializationFailed {
             error: DeserializationError::InvalidPoint(e),
@@ -101,25 +195,34 @@ pub fn sign_and_broadcast(
         my_partial_s: deserialize_s(&signatures[0].0.as_ref()[32..])?,
     };
 
-    let partial_sigs: Vec<_> =
-        signatures[1..].iter().map(|s| deserialize_s(&s.0.as_ref()[32..])).collect::<Result<_, _>>()?;
+    let partial_sigs: Vec<_> = signatures[1..]
+        .iter()
+        .map(|s| deserialize_s(&s.0.as_ref()[32..]))
+        .collect::<Result<_, _>>()?;
 
-    // Add the signatures up
     let full_sig = musig2::aggregate_partial_signatures(&first_sig, &partial_sigs);
 
     let mut sig_bytes = [0u8; 64];
     sig_bytes[..32].copy_from_slice(&*full_sig.R.to_bytes(true));
     sig_bytes[32..].copy_from_slice(&full_sig.s.to_bytes());
-    let sig = Signature::new(&sig_bytes);
+    Signature::try_from(sig_bytes).map_err(|_| Error::InvalidSignature)
+}
 
-    // Create the same transaction again
-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
-    // Insert the recent_block_hash and the signature to the right places
+/// Verify and return the signed transaction (legacy SOL transfer).
+pub fn sign_and_broadcast(
+    amount_lamports: u64,
+    to: Pubkey,
+    recent_block_hash: Hash,
+    keys: Vec<Pubkey>,
+    signatures: Vec<PartialSignature>,
+) -> Result<Transaction, Error> {
+    let aggpubkey = aggregate_public_key(keys.clone())?;
+    let sig = aggregate_signature(keys, signatures)?;
+
+    let mut tx = create_unsigned_transaction(amount_lamports, &to, &aggpubkey);
     tx.message.recent_blockhash = recent_block_hash;
-    assert_eq!(tx.signatures.len(), 1);
     tx.signatures[0] = sig;
 
-    // Make sure the resulting transaction is actually valid.
     if tx.verify().is_err() {
         return Err(Error::InvalidSignature);
     }
@@ -136,7 +239,8 @@ struct PartialSigner {
 
 impl Signer for PartialSigner {
     fn try_pubkey(&self) -> Result<Pubkey, SignerError> {
-        Ok(Pubkey::new(&*self.aggregated_pubkey.agg_public_key.to_bytes(true)))
+        Pubkey::try_from(&*self.aggregated_pubkey.agg_public_key.to_bytes(true))
+            .map_err(|e| SignerError::Custom(format!("invalid aggregate pubkey: {e}")))
     }
 
     fn try_sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
@@ -151,7 +255,7 @@ impl Signer for PartialSigner {
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&*sig.R.to_bytes(true));
         sig_bytes[32..].copy_from_slice(&sig.my_partial_s.to_bytes());
-        Ok(Signature::new(&sig_bytes))
+        Signature::try_from(sig_bytes).map_err(|e| SignerError::Custom(e.to_string()))
     }
 
     fn is_interactive(&self) -> bool {
@@ -159,64 +263,48 @@ impl Signer for PartialSigner {
     }
 }
 
+/// Amount helper used by callers that think in SOL.
+pub fn sol_to_lamports(amount: f64) -> u64 {
+    native_token::sol_to_lamports(amount)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::native_token::lamports_to_sol;
-    use crate::serialization::Serialize;
-    use crate::tss::{key_agg, sign_and_broadcast, step_one, step_two};
-    use solana_sdk::pubkey::Pubkey;
-    use solana_sdk::signature::{Keypair, Signer};
-    use solana_streamer::socket::SocketAddrSpace;
-    use solana_test_validator::TestValidator;
+    use super::*;
+    use crate::serialization::SerializeCustom;
 
-    fn clone_keypair(k: &Keypair) -> Keypair {
-        Keypair::from_bytes(&k.to_bytes()).unwrap()
-    }
-    fn clone_serialize<T: Serialize>(t: &T) -> T {
-        let mut v = Vec::new();
-        t.serialize(&mut v);
-        T::deserialize(&v).unwrap()
-    }
     #[test]
-    fn test_roundtrip() {
-        let n = 5;
-        let mut rng = rand07::thread_rng();
-        let keys: Vec<_> = (0..n).map(|_| Keypair::generate(&mut rng)).collect();
-        let pubkeys: Vec<_> = keys.iter().map(|k| k.pubkey()).collect();
-        // Key Generation
-        let aggpubkey = key_agg(pubkeys.clone(), None).unwrap().agg_public_key;
-        let aggpubkey_solana = Pubkey::new(&*aggpubkey.to_bytes(true));
-        let full_amount = 500_000_000;
-        // Get some money in it
-        let testnet = TestValidator::with_no_fees(aggpubkey_solana, None, SocketAddrSpace::Unspecified);
-        let rpc_client = testnet.get_rpc_client();
+    fn three_party_musig_roundtrip() {
+        let message = b"mpc-relay test message";
 
-        // step 1
-        let to = Keypair::generate(&mut rng);
-        let (first_msgs, first_secrets): (Vec<_>, Vec<_>) = keys.iter().map(clone_keypair).map(step_one).unzip();
+        let keys: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
+        let pubkeys: Vec<Pubkey> = keys.iter().map(|k| k.pubkey()).collect();
 
-        let recent_block_hash = rpc_client.get_latest_blockhash().unwrap();
-        // step 2
-        let amount = lamports_to_sol(full_amount / 2);
-        let memo = Some("test_roundtrip".to_string());
-
-        let partial_sigs: Vec<_> = keys
+        let (msgs, secrets): (Vec<_>, Vec<_>) = keys.iter().map(step_one).unzip();
+        // Serialize/deserialize like the HTTP layer does, to exercise the wire format.
+        let msgs: Vec<AggMessage1> = msgs
             .iter()
-            .map(clone_keypair)
-            .zip(first_secrets.into_iter())
+            .map(|m| AggMessage1::deserialize_bs58(m.serialize_bs58()).unwrap())
+            .collect();
+
+        let partials: Vec<PartialSignature> = keys
+            .iter()
             .enumerate()
-            .map(|(i, (key, secret))| {
-                let mut first_msgs: Vec<_> = first_msgs.iter().map(clone_serialize).collect();
-                first_msgs.remove(i);
-                step_two(key, amount, to.pubkey(), memo.clone(), recent_block_hash, pubkeys.clone(), first_msgs, secret)
-                    .unwrap()
+            .map(|(i, key)| {
+                let others: Vec<AggMessage1> = msgs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, m)| AggMessage1::deserialize_bs58(m.serialize_bs58()).unwrap())
+                    .collect();
+                let secret = SecretAggStepOne::deserialize_bs58(secrets[i].serialize_bs58()).unwrap();
+                step_two_raw(key, message, pubkeys.clone(), others, secret).unwrap()
             })
             .collect();
 
-        let full_tx = sign_and_broadcast(amount, to.pubkey(), memo, recent_block_hash, pubkeys, partial_sigs).unwrap();
-        let sig = rpc_client.send_transaction(&full_tx).unwrap();
+        let agg = aggregate_public_key(pubkeys.clone()).unwrap();
+        let sig = aggregate_signature(pubkeys, partials).unwrap();
 
-        // Wait for confirmation
-        rpc_client.confirm_transaction_with_spinner(&sig, &recent_block_hash, rpc_client.commitment()).unwrap();
+        assert!(sig.verify(agg.as_ref(), message));
     }
 }

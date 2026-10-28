@@ -6,3 +6,32 @@ edition = "2024"
 [dependencies]
 actix-web = "4.11.0"
 tokio = "1.47.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenv = "0.15"
+
+# MuSig2 / Ed25519 threshold signing (same library the starter's tss.rs targets)
+multi-party-eddsa = { git = "https://github.com/ZenGo-X/multi-party-eddsa.git", rev = "4b5e5c8d8e92f94eed38b037e0d83ad0d2a144ea" }
+curv = { package = "curv-kzen", version = "0.9" }
+ed25519-dalek = "1"
+rand07 = { package = "rand", version = "0.7" }
+bs58 = "0.4"
+
+# Transaction / message handling. Granular crates instead of `solana-sdk` to
+# avoid its OpenSSL-linking `solana-precompiles` dependency.
+solana-hash = "2.2.1"
+solana-keypair = "2.2.3"
+solana-message = { version = "2.3.0", features = ["bincode"] }
+solana-native-token = "2.2.2"
+solana-pubkey = "2.3.0"
+solana-signature = { version = "2.3.0", features = ["verify"] }
+solana-signer = "2.2.1"
+solana-system-interface = { version = "1.0.0", features = ["bincode"] }
+solana-transaction = { version = "2.2.3", features = ["bincode", "verify"] }
+base64 = "0.22"
+bincode = "1.3"
+
+# Per-node keyshare storage
+store = { path = "../store" }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }

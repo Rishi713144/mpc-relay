@@ -4,12 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tonic = "0.14.2"
-bytes = "1.10.1"
+actix-web = "4.11.0"
+tokio = { version = "1.47.1", features = ["full"] }
 futures = "0.3.31"
-yellowstone-grpc-proto = "9.0.0"
+anyhow = "1"
+# Yellowstone 12 builds its protos with `protoc-bin-vendored` (no autotools)
+# and still compiles on Windows. 13+ imports tokio's Unix-only UnixStream.
+yellowstone-grpc-client = "=12.0.0"
+yellowstone-grpc-proto = "=12.0.0"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 store = { path = "../store" }
+# Only the address type is needed here.
+solana-pubkey = "2.3.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+dotenv = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

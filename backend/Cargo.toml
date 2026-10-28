@@ -9,9 +9,28 @@ futures = "0.3.31"
 tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 jsonwebtoken = "9.3.0"
 chrono = { version = "0.4", features = ["serde"] }
 bcrypt = "0.15"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 store = { path = "../store" }
+dotenv = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dashmap = "6"
+bincode = "1.3"
+base64 = "0.22"
+bs58 = "0.5"
+
+# Solana transaction building. Granular crates instead of `solana-sdk`: the
+# umbrella crate's `full` feature pulls `solana-precompiles`, which links
+# OpenSSL just to verify secp256r1 signatures. We never verify those locally.
+solana-account = "2.2.1"
+solana-hash = "2.2.1"
+solana-instruction = "2.2.1"
+solana-message = { version = "2.3.0", features = ["bincode"] }
+solana-pubkey = { version = "2.3.0", features = ["curve25519"] }
+solana-signature = { version = "2.3.0", features = ["verify"] }
+solana-signer = "2.2.1"
+solana-system-interface = { version = "1.0.0", features = ["bincode"] }
+solana-transaction = { version = "2.2.3", features = ["bincode", "verify"] }
