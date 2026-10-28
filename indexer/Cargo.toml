@@ -9,3 +9,7 @@ tonic = "0.14.2"
 bytes = "1.10.1"
 futures = "0.3.31"
 yellowstone-grpc-proto = "9.0.0"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+store = { path = "../store" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

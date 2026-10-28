@@ -1,4 +1,5 @@
 pub mod user;
+pub mod balances;
 
 use sqlx::PgPool;
 

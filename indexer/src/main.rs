@@ -1,12 +1,10 @@
-use yellowstone::GeyserGrpcClient;
+pub mod watchlist;
 pub mod yellowstone;
 
+use watchlist::WatchList;
+
 #[tokio::main]
-async fn main() {   
-    let client = GeyserGrpcClient::new(HealthClient::new(), GeyserClient::new());
-    client.health_check().await;
-
-    
-
-
+async fn main() {
+    let _watchlist = WatchList::new();
+    println!("Indexer started");
 }

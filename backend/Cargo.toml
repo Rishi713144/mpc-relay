@@ -5,6 +5,13 @@ edition = "2024"
 
 [dependencies]
 actix-web = "4.11.0"
-tokio = "1.47.1"
+actix-web-httpauth = "0.8.2"
+tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+jsonwebtoken = "9.3.0"
+chrono = { version = "0.4", features = ["serde"] }
+bcrypt = "0.15"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+store = { path = "../store" }
